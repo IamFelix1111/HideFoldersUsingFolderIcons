@@ -1,0 +1,46 @@
+# ---- CLion / JetBrains IDE ----
+.idea/
+cmake-build-*/
+
+# ---- CMake ----
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+CMakeLists.txt.user
+
+# ---- Build output ----
+build/
+out/
+bin/
+lib/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.app
+*.pdb
+*.ilk
+
+# ---- Precompiled headers / C20 database ----
+*.ipch
+compile_commands.json
+.vscode/
+.vs/
+
+# ---- Windows ----
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ---- Temporary / backup files ----
+*.tmp
+*.bak
+*.swp
+*~
