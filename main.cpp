@@ -118,6 +118,7 @@ struct ItemCache {         // last applied sample per icon rect
 std::vector<ItemCache> g_itemCache;
 int g_iconGen = 0;
 unsigned long long g_updates = 0;
+std::set<int> g_probeApplied; // target indices already handled via probe this cycle
 
 // ----------------------------------------------------------------- logging --
 
@@ -632,6 +633,8 @@ bool IsDesktopDir(const std::wstring& dir) {
 void DeleteArtifactsIn(const std::wstring& dir) {
     for (int i = 0; i < kIconSlots; ++i)
         DeleteFileW((dir + L"\\wall_icon_" + std::to_wstring(i) + L".ico").c_str());
+    for (int i = 0; i < 16; ++i) // marker probes
+        DeleteFileW((dir + L"\\marker_" + std::to_wstring(i) + L".ico").c_str());
 }
 
 // Decide what to camouflage: an explicit .lnk argument (single shortcut),
@@ -733,8 +736,12 @@ void ApplyToTargets(const FolderLoc& loc, const std::wstring& ico,
     }
     const bool locIsShortcut = (loc.overlay & LVIS_OVERLAYMASK) != 0;
 
-    for (const auto& t : g_targets) {
+    for (size_t ti = 0; ti < g_targets.size(); ++ti) {
+        const CamTarget& t = g_targets[ti];
         if (!NameMatch(t, loc.text)) continue;
+        // probe-calibrated targets already carry their measured icon this
+        // cycle; applying list-view-rect content here would undo the fix
+        if (g_probeApplied.count((int)ti)) continue;
         if (ambiguous && useOverlay && t.isLnk != locIsShortcut) continue;
         if (t.isLnk) SetLnkIconLocation(t.lnk, ico);
         else ApplyFolderIcon(g_folder, ico);
@@ -745,6 +752,257 @@ void ApplyToTargets(const FolderLoc& loc, const std::wstring& ico,
 }
 
 void DeleteArtifacts() { DeleteArtifactsIn(g_artifactsDir); }
+
+// -------------------------------------------------------- probe calibration --
+// Desktop organizers decide themselves where icons render - list-view rects
+// can be plain wrong once an organizer is active - and some organizers hide
+// the shortcut arrow overlay too. The only source that is always right is
+// what the desktop actually PAINTS: temporarily set every target's icon to a
+// unique saturated probe pattern, capture the desktop's own windows with
+// PrintWindow (no screen screenshot - works even while other windows cover
+// the desktop), find the probe pixels, and read position AND size from where
+// each probe really rendered.
+namespace marker {
+
+#ifndef PW_CLIENTONLY
+#define PW_CLIENTONLY 0x01
+#endif
+#ifndef PW_RENDERFULLCONTENT
+#define PW_RENDERFULLCONTENT 0x02
+#endif
+
+constexpr int kProbeSize = 64; // probe source icon size (px)
+struct Pal { BYTE b, g, r; };
+const Pal kAnchor{255, 0, 255}; // magenta: left half of every probe
+// right-half colors identify the target; saturated hues a photo wallpaper
+// never averages to, kept far apart from each other and from the anchor
+const Pal kUnique[] = {
+    {255, 255, 0}, {0, 0, 255}, {0, 255, 0},   {255, 0, 0},
+    {0, 255, 255}, {0, 128, 255}, {255, 0, 192}, {255, 128, 0},
+    {128, 255, 0}, {128, 0, 255}, {255, 128, 128}, {128, 255, 255},
+};
+
+bool PalClose(const BYTE* p, const Pal& c) {
+    return std::abs((int)p[0] - (int)c.b) <= 80 && std::abs((int)p[1] - (int)c.g) <= 80 &&
+           std::abs((int)p[2] - (int)c.r) <= 80;
+}
+
+std::wstring ProbePath(int ti) {
+    return g_artifactsDir + L"\\marker_" + std::to_wstring(ti) + L".ico";
+}
+
+// A square probe: anchor-colored left half + unique-colored right half.
+void WriteProbe(int ti) {
+    Shot s;
+    s.w = s.h = kProbeSize;
+    s.px.resize((size_t)kProbeSize * kProbeSize * 4);
+    for (int y = 0; y < kProbeSize; ++y)
+        for (int x = 0; x < kProbeSize; ++x) {
+            const Pal& c = x < kProbeSize / 2 ? kAnchor : kUnique[ti % ARRAYSIZE(kUnique)];
+            BYTE* d = &s.px[((size_t)(kProbeSize - 1 - y) * kProbeSize + x) * 4];
+            d[0] = c.b; d[1] = c.g; d[2] = c.r; d[3] = 0xFF;
+        }
+    WriteIcoFile(ProbePath(ti), s);
+}
+
+void ApplyProbe(const CamTarget& t, int ti) {
+    if (t.isLnk) SetLnkIconLocation(t.lnk, ProbePath(ti));
+    else ApplyFolderIcon(g_folder, ProbePath(ti));
+}
+
+// Capture a window's client area WITHOUT a screen screenshot: PrintWindow
+// makes the target window paint into our DC, so covering windows do not
+// matter. Tries DWM full-content rendering first, classic GDI second.
+bool CaptureWindowClient(HWND wnd, Shot& s) {
+    RECT cr{};
+    if (!GetClientRect(wnd, &cr)) return false;
+    s.w = cr.right - cr.left;
+    s.h = cr.bottom - cr.top;
+    if (s.w < 8 || s.h < 8 || s.w > 8192 || s.h > 8192) return false;
+    HDC scr = GetDC(nullptr);
+    if (!scr) return false;
+    HDC mem = CreateCompatibleDC(scr);
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = s.w;
+    bmi.bmiHeader.biHeight = s.h; // positive = bottom-up, like CaptureRect
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP hb = CreateDIBSection(scr, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    bool ok = false;
+    if (hb && bits) {
+        HGDIOBJ old = SelectObject(mem, hb);
+        for (int pass = 0; pass < 2 && !ok; ++pass) {
+            UINT flags = pass == 0 ? (PW_CLIENTONLY | PW_RENDERFULLCONTENT) : PW_CLIENTONLY;
+            memset(bits, 0, (size_t)s.w * s.h * 4);
+            if (!PrintWindow(wnd, mem, (UINT)flags)) continue;
+            // reject blank captures (unsupported renderer)
+            size_t lit = 0, total = (size_t)s.w * s.h;
+            const DWORD* dw = (const DWORD*)bits;
+            for (size_t i = 0; i < total; i += 16) // subsampled check
+                if (dw[i]) ++lit;
+            if (lit == 0) continue;
+            s.px.resize(total * 4);
+            memcpy(s.px.data(), bits, total * 4);
+            ok = true;
+        }
+        SelectObject(mem, old);
+    }
+    if (hb) DeleteObject(hb);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, scr);
+    return ok;
+}
+
+struct ProbeHit { int targetIdx; RECT screenRect; };
+
+// Scan a captured image (image origin ox,oy in screen coords) for probe
+// patterns: cluster anchor-colored pixels, validate the cluster shape, then
+// identify the target by the unique color next to the anchor half.
+void FindProbes(const Shot& s, int ox, int oy, const std::vector<int>& wantIds,
+                std::vector<ProbeHit>& out) {
+    if (s.w < 16 || s.h < 16) return;
+    auto pxAt = [&](int x, int y) -> const BYTE* {
+        return &s.px[((size_t)(s.h - 1 - y) * s.w + x) * 4]; // bottom-up storage
+    };
+    struct Cl { int x0, y0, x1, y1, n; }; // real pixel coords, top-down
+    std::vector<Cl> cls;
+    for (int y = 0; y < s.h; y += 2)
+        for (int x = 0; x < s.w; x += 2) {
+            if (!PalClose(pxAt(x, y), kAnchor)) continue;
+            if (cls.size() > 256) return; // wallpaper far too magenta: bail
+            bool merged = false;
+            for (auto& c : cls) {
+                if (x >= c.x0 - 16 && x <= c.x1 + 16 && y >= c.y0 - 16 && y <= c.y1 + 16) {
+                    c.x0 = std::min(c.x0, x); c.y0 = std::min(c.y0, y);
+                    c.x1 = std::max(c.x1, x); c.y1 = std::max(c.y1, y);
+                    ++c.n;
+                    merged = true;
+                    break;
+                }
+            }
+            if (!merged) cls.push_back({x, y, x, y, 1});
+        }
+    for (const auto& c : cls) {
+        const int aw = c.x1 - c.x0 + 1, ah = c.y1 - c.y0 + 1; // anchor half
+        if (c.n < 40 || aw < 8 || ah < 8 || aw > 512 || ah > 512) continue;
+        if (std::abs(ah - aw * 2) > ah / 2) continue; // icon should be ~square
+        const int ix0 = c.x0, iy0 = c.y0, ix1 = c.x0 + aw * 2 - 1, iy1 = c.y1;
+        if (ix1 >= s.w) continue;
+        int best = -1;
+        size_t bestCnt = 0, tot = 0;
+        std::vector<size_t> cnt(wantIds.size(), 0);
+        for (int y = iy0; y <= iy1; y += 2)
+            for (int x = ix0 + aw; x <= ix1; x += 2) {
+                const BYTE* p = pxAt(x, y);
+                ++tot;
+                for (size_t k = 0; k < wantIds.size(); ++k)
+                    if (PalClose(p, kUnique[wantIds[k] % ARRAYSIZE(kUnique)])) ++cnt[k];
+            }
+        if (!tot) continue;
+        for (size_t k = 0; k < cnt.size(); ++k)
+            if (cnt[k] > bestCnt) { bestCnt = cnt[k]; best = (int)k; }
+        if (best < 0 || bestCnt * 10 < tot) continue; // <10% of the half: noise
+        ProbeHit h;
+        h.targetIdx = wantIds[best];
+        h.screenRect = {ox + ix0, oy + iy0, ox + ix1 + 1, oy + iy1 + 1};
+        out.push_back(h);
+        Log(L"probe: target#%d rendered at (%d,%d)-(%d,%d) %dx%d", h.targetIdx,
+            h.screenRect.left, h.screenRect.top, h.screenRect.right, h.screenRect.bottom,
+            h.screenRect.right - h.screenRect.left, h.screenRect.bottom - h.screenRect.top);
+    }
+}
+
+struct CandCtx { std::vector<HWND>* v; };
+
+BOOL CALLBACK CandTopCb(HWND h, LPARAM lp) {
+    auto* c = (CandCtx*)lp;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid == g_selfPid) return TRUE;
+    if (!IsWindowVisible(h)) return TRUE;
+    RECT wr{};
+    if (!GetWindowRect(h, &wr)) return TRUE;
+    HMONITOR hm = MonitorFromRect(&wr, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{sizeof mi};
+    if (!GetMonitorInfoW(hm, &mi)) return TRUE;
+    const long long wa = (long long)(wr.right - wr.left) * (wr.bottom - wr.top);
+    const long long ma = (long long)(mi.rcMonitor.right - mi.rcMonitor.left) *
+                         (mi.rcMonitor.bottom - mi.rcMonitor.top);
+    if (wa * 2 < ma) return TRUE; // not desktop-sized
+    for (HWND x : *c->v)
+        if (x == h) return TRUE;
+    c->v->push_back(h); // EnumWindows yields topmost first
+    return TRUE;
+}
+
+// Windows that might be painting the desktop icons: any visible
+// desktop-sized window (organizers draw icons in their own layer, ABOVE
+// explorer), then the located list views' roots as a last resort.
+std::vector<HWND> CaptureCandidates(const std::vector<FolderLoc>& locs) {
+    std::vector<HWND> v;
+    CandCtx ctx{&v};
+    EnumWindows(CandTopCb, (LPARAM)&ctx);
+    for (const auto& l : locs) {
+        HWND add[] = {GetAncestor(l.lv, GA_ROOT), l.lv};
+        for (HWND h : add) {
+            if (!h) continue;
+            bool dup = false;
+            for (HWND x : v)
+                if (x == h) { dup = true; break; }
+            if (!dup) v.push_back(h);
+        }
+    }
+    return v;
+}
+
+// One full probe pass: apply probe icons, wait for the repaint, then hunt
+// the probe pixels in every candidate window. Fills `out` per target.
+bool RunProbePass(const std::vector<FolderLoc>& locs, std::vector<ProbeHit>& out) {
+    std::vector<int> wantIds;
+    const int n = (int)g_targets.size();
+    for (int i = 0; i < n && i < (int)ARRAYSIZE(kUnique); ++i) {
+        WriteProbe(i);
+        ApplyProbe(g_targets[i], i);
+        wantIds.push_back(i);
+    }
+    if (wantIds.empty()) return false;
+
+    const std::vector<HWND> cands = CaptureCandidates(locs);
+    for (int attempt = 0; attempt < 6; ++attempt) { // repaint can lag a bit
+        Sleep(250);
+        for (HWND c : cands) {
+            Shot s;
+            if (!CaptureWindowClient(c, s)) continue;
+            POINT org{};
+            ClientToScreen(c, &org);
+            std::vector<ProbeHit> hits;
+            FindProbes(s, org.x, org.y, wantIds, hits);
+            for (const auto& h : hits) {
+                bool have = false;
+                for (const auto& o : out)
+                    if (o.targetIdx == h.targetIdx) { have = true; break; }
+                if (!have) out.push_back(h);
+            }
+        }
+        if (out.size() == wantIds.size()) return true; // all found
+        // some renderers never draw a target (desktop.ini under organizers):
+        // accept a partial result after a second attempt
+        if (!out.empty() && attempt >= 1) return true;
+    }
+    return !out.empty();
+}
+
+} // namespace marker
+
+bool g_probeValid = false;                  // probe rects measured and fresh
+std::vector<marker::ProbeHit> g_probeRects; // per-target rendered rects
+std::wstring g_probeWallPath;               // wallpaper the rects were measured on
+FILETIME g_probeWallMtime{};
+unsigned g_cycleCount = 0;
+unsigned g_probeRetryAt = 0;                // cycle number to retry probing
 
 // -------------------------------------------------------- wallpaper source --
 // Preferred sampling path: read the wallpaper FILE (IDesktopWallpaper) and
@@ -1025,6 +1283,12 @@ bool SampleRect(const RECT& rc, Shot& s) {
     return true;
 }
 
+// Current wallpaper identity (empty path = solid-color desktop).
+void CurrentWallpaper(std::wstring& path, FILETIME& mt) {
+    path = g_info.path;
+    mt = g_info.mtime;
+}
+
 } // namespace wall
 
 // ------------------------------------------------------------------ logic --
@@ -1098,6 +1362,63 @@ bool DoCycle() {
     const wchar_t* mode = L"";
     RECT lastRc{};
     int lastW = 0, lastH = 0;
+
+    // Probe calibration (namespace marker): sample where the icons REALLY
+    // render instead of trusting list-view geometry. Re-measure when the
+    // wallpaper changes; retry occasionally after a failed pass.
+    ++g_cycleCount;
+    g_probeApplied.clear();
+    if (wall::RefreshFor(locs[0].iconRectScreen)) {
+        std::wstring wp;
+        FILETIME wmt{};
+        wall::CurrentWallpaper(wp, wmt);
+        if (g_probeValid &&
+            (wp != g_probeWallPath || memcmp(&wmt, &g_probeWallMtime, sizeof wmt) != 0)) {
+            g_probeValid = false;
+            Log(L"wallpaper changed -> probe re-measure");
+        }
+    }
+    if (!g_probeValid && g_cycleCount >= g_probeRetryAt) {
+        std::vector<marker::ProbeHit> pr;
+        if (marker::RunProbePass(locs, pr)) {
+            g_probeRects = std::move(pr);
+            g_probeValid = true;
+            wall::CurrentWallpaper(g_probeWallPath, g_probeWallMtime);
+            Log(L"probe calibrated: %d target(s)", (int)g_probeRects.size());
+        } else {
+            g_probeRetryAt = g_cycleCount + 50; // ~10s at the default interval
+            Log(L"probe pass found nothing; retry in %u cycle(s)",
+                g_probeRetryAt - g_cycleCount);
+        }
+    }
+    if (g_probeValid) {
+        for (const auto& h : g_probeRects) {
+            Shot s;
+            if (!wall::RefreshFor(h.screenRect) || !wall::SampleRect(h.screenRect, s)) continue;
+            lastRc = h.screenRect;
+            lastW = s.w;
+            lastH = s.h;
+            ItemCache* cache = FindItemCache(h.screenRect);
+            if (cache && cache->w == s.w && cache->h == s.h && cache->px == s.px) {
+                ++unchangedCount;
+                continue;
+            }
+            std::wstring ico = g_artifactsDir + L"\\wall_icon_" +
+                               std::to_wstring(g_iconGen % kIconSlots) + L".ico";
+            if (!WriteIcoFile(ico, s)) continue;
+            const CamTarget& t = g_targets[h.targetIdx];
+            if (t.isLnk) SetLnkIconLocation(t.lnk, ico);
+            else ApplyFolderIcon(g_folder, ico);
+            g_iconGen++;
+            StoreItemCache(h.screenRect, s.w, s.h, std::move(s.px));
+            g_updates++;
+            ++updated;
+            g_probeApplied.insert(h.targetIdx);
+            Log(L"icon updated #%llu target#%d -> %ls (probe rect %d,%d)", g_updates,
+                h.targetIdx, ico.c_str(), h.screenRect.left, h.screenRect.top);
+        }
+        mode = L"探针 probe · 壁纸文件 wallpaper-file";
+    }
 
     for (const auto& loc : locs) {
         const bool covered = RectCovered(loc.iconRectScreen, expPids);
@@ -1285,6 +1606,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 DeleteArtifacts();
             g_itemCache.clear();
             g_wallTrusted = false;
+            g_probeValid = false;
             UpdateStatus(L"已恢复默认图标 Icon restored（后台继续伪装中）");
         } else if (id == IDB_EXIT && code == BN_CLICKED) {
             DestroyWindow(h);
