@@ -31,9 +31,13 @@
 #endif
 #define WIN32_LEAN_AND_MEAN
 
+#define NOMINMAX
 #include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shobjidl_core.h>
+#include <wincodec.h>
+#include <objbase.h>
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <tlhelp32.h>
@@ -43,6 +47,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <set>
 #include <string>
 #include <vector>
@@ -53,6 +58,8 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "windowscodecs.lib")
 #endif
 
 #ifndef DWMWA_CLOAKED
@@ -84,11 +91,14 @@ HFONT g_font = nullptr;
 DWORD g_selfPid = 0;
 
 std::wstring g_folder;      // folder to camouflage
+std::wstring g_lnkPath;     // set: camouflage this desktop shortcut (.lnk) instead
+std::wstring g_artifactsDir;// where wall_icon_*.ico files are written
 UINT g_intervalMs = 200;
 bool g_logEnabled = false;
 bool g_onceMode = false;
 bool g_locateMode = false;
 bool g_helpOnly = false;
+bool g_wallTrusted = false; // wallpaper-file sampling verified against screen
 
 std::vector<BYTE> g_lastPx; // last sampled background
 int g_lastW = 0, g_lastH = 0;
@@ -292,10 +302,16 @@ struct FolderLoc {
     POINT slot{};
 };
 
-bool LocateOnDesktop(const std::wstring& name, const std::set<DWORD>& expPids, FolderLoc& out) {
+bool LocateOnDesktop(const std::vector<std::wstring>& names, const std::set<DWORD>& expPids, FolderLoc& out) {
     EnumCtx ctx;
     ctx.pids = &expPids;
     EnumWindows(EnumTopCb, (LPARAM)&ctx);
+
+    auto matches = [&](const std::wstring& t) {
+        for (const auto& n : names)
+            if (lstrcmpiW(t.c_str(), n.c_str()) == 0) return true;
+        return false;
+    };
 
     auto tryList = [&](std::vector<HWND>& lvs, int cap) {
         for (HWND lv : lvs) {
@@ -305,7 +321,7 @@ bool LocateOnDesktop(const std::wstring& name, const std::set<DWORD>& expPids, F
             if (n <= 0 || n > cap) continue;
             for (int i = 0; i < n; ++i) {
                 std::wstring t;
-                if (!rl.Text(i, t) || lstrcmpiW(t.c_str(), name.c_str()) != 0) continue;
+                if (!rl.Text(i, t) || !matches(t)) continue;
                 RECT rc{};
                 POINT pt{};
                 if (rl.IconRect(i, rc) && rl.Pos(i, pt)) {
@@ -315,7 +331,7 @@ bool LocateOnDesktop(const std::wstring& name, const std::set<DWORD>& expPids, F
                     out.iconRectScreen = rc;
                     out.slot = pt;
                     Log(L"located '%s' item %d in %dx%d view, icon rect (%d,%d)-(%d,%d)",
-                        name.c_str(), i, n, n, rc.left, rc.top, rc.right, rc.bottom);
+                        t.c_str(), i, n, n, rc.left, rc.top, rc.right, rc.bottom);
                     return true;
                 }
             }
@@ -460,18 +476,466 @@ void ApplyFolderIcon(const std::wstring& folder, const std::wstring& ico) {
     NotifyShell(folder);
 }
 
+void DeleteArtifacts();
+
 void RestoreFolderIcon(const std::wstring& folder) {
     DeleteFileW((folder + L"\\desktop.ini").c_str());
-    for (int i = 0; i < kIconSlots; ++i)
-        DeleteFileW((folder + L"\\wall_icon_" + std::to_wstring(i) + L".ico").c_str());
+    DeleteArtifacts();
     DWORD at = GetFileAttributesW(folder.c_str());
     if (at != INVALID_FILE_ATTRIBUTES)
         SetFileAttributesW(folder.c_str(), at & ~FILE_ATTRIBUTE_SYSTEM);
     g_lastW = 0;
     g_lastH = 0;
     g_lastPx.clear();
+    g_wallTrusted = false;
     NotifyShell(folder);
 }
+
+// ------------------------------------------------------- shortcut (.lnk) mode --
+// Some desktop organizers ignore desktop.ini folder icons but happily show
+// shortcut icons, so the target can also be a desktop shortcut whose icon
+// we rewrite (IShellLinkW::SetIconLocation) every refresh.
+
+bool HasExt(const std::wstring& p, const wchar_t* ext) {
+    size_t n = p.size(), m = wcslen(ext);
+    return n > m && _wcsicmp(p.c_str() + n - m, ext) == 0;
+}
+
+bool ResolveLnkTarget(const std::wstring& lnk, std::wstring& target) {
+    IShellLinkW* sl = nullptr;
+    IPersistFile* pf = nullptr;
+    bool ok = false;
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&sl))) &&
+        SUCCEEDED(sl->QueryInterface(IID_PPV_ARGS(&pf))) &&
+        SUCCEEDED(pf->Load(lnk.c_str(), STGM_READ))) {
+        WCHAR buf[MAX_PATH]{};
+        if (SUCCEEDED(sl->GetPath(buf, MAX_PATH, nullptr, SLGP_RAWPATH)) && buf[0]) {
+            target = buf;
+            ok = true;
+        }
+    }
+    if (pf) pf->Release();
+    if (sl) sl->Release();
+    return ok;
+}
+
+bool SetLnkIconLocation(const std::wstring& lnk, const std::wstring& ico) {
+    IShellLinkW* sl = nullptr;
+    IPersistFile* pf = nullptr;
+    bool ok = false;
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&sl))) &&
+        SUCCEEDED(sl->QueryInterface(IID_PPV_ARGS(&pf))) &&
+        SUCCEEDED(pf->Load(lnk.c_str(), STGM_READ))) {
+        sl->SetIconLocation(ico.c_str(), 0);
+        if (SUCCEEDED(pf->Save(lnk.c_str(), TRUE))) {
+            SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATH | SHCNF_FLUSH, lnk.c_str(), nullptr);
+            ok = true;
+        }
+    }
+    if (pf) pf->Release();
+    if (sl) sl->Release();
+    return ok;
+}
+
+bool ResetLnkIcon(const std::wstring& lnk) {
+    IShellLinkW* sl = nullptr;
+    IPersistFile* pf = nullptr;
+    bool ok = false;
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&sl))) &&
+        SUCCEEDED(sl->QueryInterface(IID_PPV_ARGS(&pf))) &&
+        SUCCEEDED(pf->Load(lnk.c_str(), STGM_READ))) {
+        sl->SetIconLocation(L"", 0); // fall back to the target's own icon
+        if (SUCCEEDED(pf->Save(lnk.c_str(), TRUE))) {
+            SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATH | SHCNF_FLUSH, lnk.c_str(), nullptr);
+            ok = true;
+        }
+    }
+    if (pf) pf->Release();
+    if (sl) sl->Release();
+    return ok;
+}
+
+void DesktopDirs(std::vector<std::wstring>& dirs) {
+    for (const KNOWNFOLDERID& id : {FOLDERID_Desktop, FOLDERID_PublicDesktop}) {
+        PWSTR p = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(id, 0, nullptr, &p)) && p) {
+            dirs.push_back(p);
+            CoTaskMemFree(p);
+        }
+    }
+}
+
+std::wstring FindLnkForFolder(const std::wstring& dir) {
+    std::vector<std::wstring> dirs;
+    DesktopDirs(dirs);
+    for (const auto& d : dirs) {
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW((d + L"\\*.lnk").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            std::wstring lnk = d + L"\\" + fd.cFileName;
+            std::wstring t;
+            if (ResolveLnkTarget(lnk, t) && _wcsicmp(t.c_str(), dir.c_str()) == 0) return lnk;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    return L"";
+}
+
+bool DirExists(const std::wstring& p) {
+    DWORD at = GetFileAttributesW(p.c_str());
+    return at != INVALID_FILE_ATTRIBUTES && (at & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+bool SamePath(const std::wstring& a, const std::wstring& b) {
+    wchar_t ca[MAX_PATH]{}, cb[MAX_PATH]{};
+    if (!_wfullpath(ca, a.c_str(), MAX_PATH) || !_wfullpath(cb, b.c_str(), MAX_PATH)) return false;
+    return _wcsicmp(ca, cb) == 0;
+}
+
+bool IsDesktopDir(const std::wstring& dir) {
+    std::vector<std::wstring> dirs;
+    DesktopDirs(dirs);
+    for (const auto& d : dirs)
+        if (SamePath(dir, d)) return true;
+    return false;
+}
+
+void DeleteArtifactsIn(const std::wstring& dir) {
+    for (int i = 0; i < kIconSlots; ++i)
+        DeleteFileW((dir + L"\\wall_icon_" + std::to_wstring(i) + L".ico").c_str());
+}
+
+// Decide what to camouflage: an explicit .lnk argument, a desktop shortcut
+// pointing at the folder argument (organizer-friendly), or the folder itself.
+void InitTargetMode() {
+    if (!g_folder.empty() && HasExt(g_folder, L".lnk")) {
+        g_lnkPath = g_folder;
+    } else if (DirExists(g_folder)) {
+        std::wstring lnk = FindLnkForFolder(g_folder);
+        if (!lnk.empty()) g_lnkPath = lnk;
+    }
+    std::wstring dir;
+    if (!g_lnkPath.empty()) {
+        std::wstring t;
+        if (ResolveLnkTarget(g_lnkPath, t) && DirExists(t)) dir = t;
+    } else if (DirExists(g_folder)) {
+        dir = g_folder;
+    }
+    // wall_icon_*.ico must never sit on the desktop itself
+    std::wstring exeDir = DirOf(ExePathW());
+    if (dir.empty() || SamePath(dir, exeDir) == false && IsDesktopDir(dir)) {
+        dir = exeDir;
+        if (IsDesktopDir(dir)) dir.clear();
+    }
+    if (dir.empty()) {
+        wchar_t tp[MAX_PATH]{};
+        if (GetTempPathW(MAX_PATH, tp)) {
+            dir = std::wstring(tp) + L"HFUFO_icons";
+            SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
+        }
+    }
+    g_artifactsDir = dir;
+    Log(L"target: folder=%ls shortcut=%ls artifacts=%ls mode=%s",
+        g_folder.c_str(), g_lnkPath.c_str(), g_artifactsDir.c_str(),
+        g_lnkPath.empty() ? L"desktop.ini" : L"shortcut icon");
+}
+
+std::vector<std::wstring> LocateNames() {
+    std::vector<std::wstring> v;
+    if (!g_lnkPath.empty()) {
+        std::wstring base = BaseName(g_lnkPath);
+        if (HasExt(base, L".lnk")) base = base.substr(0, base.size() - 4);
+        v.push_back(base);                 // explorer usually hides ".lnk"
+        v.push_back(BaseName(g_lnkPath));  // shown when extensions are visible
+    } else {
+        v.push_back(BaseName(g_folder));
+    }
+    return v;
+}
+
+void DeleteArtifacts() { DeleteArtifactsIn(g_artifactsDir); }
+
+// -------------------------------------------------------- wallpaper source --
+// Preferred sampling path: read the wallpaper FILE (IDesktopWallpaper) and
+// crop what the desktop shows at the icon rect. Works while other windows
+// cover the desktop and without moving icons at all. Pixel output is
+// verified against a real screenshot once the spot is visible; a mismatch
+// (wallpaper engines render dynamically) disables file mode for the session.
+namespace wall {
+
+struct Info {
+    std::wstring path;
+    FILETIME mtime{};
+    std::vector<BYTE> px; // 32bpp BGRA top-down
+    int w = 0, h = 0;
+    bool solid = false;
+    DWORD back = 0;
+    DESKTOP_WALLPAPER_POSITION pos = DWPOS_FILL;
+} g_info;
+
+double MeanDiff(const std::vector<BYTE>& a, const std::vector<BYTE>& b) {
+    if (a.size() != b.size() || a.empty()) return 100.0;
+    long long sum = 0;
+    const size_t px = a.size() / 4;
+    for (size_t i = 0; i < a.size(); i += 4)
+        sum += std::abs((int)a[i] - (int)b[i]) + std::abs((int)a[i + 1] - (int)b[i + 1]) +
+               std::abs((int)a[i + 2] - (int)b[i + 2]);
+    return 100.0 * (double)sum / ((double)px * 3 * 255);
+}
+
+bool DecodeImageFile(const std::wstring& path, std::vector<BYTE>& px, int& w, int& h) {
+    static IWICImagingFactory* wf = nullptr;
+    if (!wf && FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                       IID_PPV_ARGS(&wf))))
+        return false;
+    bool ok = false;
+    IWICBitmapDecoder* dec = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter* conv = nullptr;
+    if (SUCCEEDED(wf->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                                                WICDecodeMetadataCacheOnDemand, &dec)) &&
+        SUCCEEDED(dec->GetFrame(0, &frame)) &&
+        SUCCEEDED(wf->CreateFormatConverter(&conv)) &&
+        SUCCEEDED(conv->Initialize(frame, GUID_WICPixelFormat32bppBGRA,
+                                   WICBitmapDitherTypeNone, nullptr, 0.0,
+                                   WICBitmapPaletteTypeCustom))) {
+        UINT uw = 0, uh = 0;
+        conv->GetSize(&uw, &uh);
+        if (uw && uh && uw <= 16384 && uh <= 16384) {
+            px.resize((size_t)uw * uh * 4);
+            if (SUCCEEDED(conv->CopyPixels(nullptr, uw * 4, (UINT)px.size(), px.data()))) {
+                w = (int)uw;
+                h = (int)uh;
+                ok = true;
+            }
+        }
+    }
+    if (conv) conv->Release();
+    if (frame) frame->Release();
+    if (dec) dec->Release();
+    return ok;
+}
+
+// Refresh cached info for the monitor containing rc; true if usable
+// (decoded image or a plain solid color).
+bool RefreshFor(const RECT& rc) {
+    // IDesktopWallpaper is declared with a manual CLSID/IID for MinGW-friendliness
+    static const CLSID clsidDwp = {0xc2cf3110, 0x460e, 0x4fc1,
+                                   {0xb9, 0xd0, 0x8a, 0x1c, 0x0c, 0x9c, 0xc4, 0xbd}};
+    static const IID iidDwp = {0xb92b56a9, 0x8b55, 0x4e14,
+                               {0x9a, 0x89, 0x01, 0x99, 0xbb, 0xb6, 0xf9, 0x3b}};
+    IDesktopWallpaper* dwp = nullptr;
+    if (FAILED(CoCreateInstance(clsidDwp, nullptr, CLSCTX_ALL, iidDwp, (void**)&dwp)) || !dwp)
+        return false;
+
+    DESKTOP_WALLPAPER_POSITION pos = DWPOS_FILL;
+    dwp->GetPosition(&pos);
+    COLORREF back = 0;
+    dwp->GetBackgroundColor(&back);
+
+    // wallpaper path for the monitor that contains the icon rect
+    std::wstring path;
+    POINT c{(rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2};
+    HMONITOR hm = MonitorFromPoint(c, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{sizeof mi};
+    GetMonitorInfoW(hm, &mi);
+    for (UINT i = 0;; ++i) {
+        LPWSTR dev = nullptr;
+        if (FAILED(dwp->GetMonitorDevicePathAt(i, &dev)) || !dev) break;
+        RECT mr{};
+        dwp->GetMonitorRECT(dev, &mr); // returns S_FALSE on the last monitor; rect is still valid
+        if (mr.right > mr.left && EqualRect(&mr, &mi.rcMonitor)) {
+            LPWSTR wpath = nullptr;
+            if (SUCCEEDED(dwp->GetWallpaper(dev, &wpath)) && wpath && wpath[0]) path = wpath;
+            if (wpath) CoTaskMemFree(wpath);
+            CoTaskMemFree(dev);
+            break;
+        }
+        CoTaskMemFree(dev);
+    }
+    if (path.empty()) { // fall back to the default/primary wallpaper
+        LPWSTR wpath = nullptr;
+        if (SUCCEEDED(dwp->GetWallpaper(nullptr, &wpath)) && wpath && wpath[0]) path = wpath;
+        if (wpath) CoTaskMemFree(wpath);
+    }
+    dwp->Release();
+
+    if (path.empty()) { // plain solid-color desktop
+        if (!g_info.solid) {
+            g_info = Info{};
+            g_info.solid = true;
+        }
+        g_info.back = back;
+        g_info.pos = pos;
+        return true;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA fa{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa)) return false;
+    if (g_info.path == path && g_info.mtime.dwLowDateTime == fa.ftLastWriteTime.dwLowDateTime &&
+        g_info.mtime.dwHighDateTime == fa.ftLastWriteTime.dwHighDateTime && !g_info.px.empty())
+        return true; // cache hit
+
+    Info ni{};
+    ni.path = path;
+    ni.mtime = fa.ftLastWriteTime;
+    ni.back = back;
+    ni.pos = pos;
+    if (!DecodeImageFile(path, ni.px, ni.w, ni.h)) return false;
+    g_info = ni;
+    return true;
+}
+
+// Fill s with what the wallpaper shows at screen rect rc.
+bool SampleRect(const RECT& rc, Shot& s) {
+    s.w = rc.right - rc.left;
+    s.h = rc.bottom - rc.top;
+    if (s.w <= 0 || s.h <= 0) return false;
+    s.px.resize((size_t)s.w * s.h * 4);
+
+    if (g_info.solid) {
+        BYTE b = GetBValue(g_info.back), g = GetGValue(g_info.back), r = GetRValue(g_info.back);
+        for (size_t i = 0; i < s.px.size(); i += 4) {
+            s.px[i] = b; s.px[i + 1] = g; s.px[i + 2] = r; s.px[i + 3] = 0xFF;
+        }
+        return true;
+    }
+
+    // destination area the wallpaper is mapped onto
+    RECT area{};
+    if (g_info.pos == DWPOS_SPAN) {
+        area.left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        area.top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        area.right = area.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        area.bottom = area.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    } else {
+        HMONITOR hm = MonitorFromPoint({(rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2},
+                                       MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{sizeof mi};
+        GetMonitorInfoW(hm, &mi);
+        area = mi.rcMonitor;
+    }
+    const double Aw = area.right - area.left, Ah = area.bottom - area.top;
+    const double iw = g_info.w, ih = g_info.h;
+    BYTE backB = GetBValue(g_info.back), backG = GetGValue(g_info.back), backR = GetRValue(g_info.back);
+
+    // how the image is laid out over the area, and the source-rect per dst pixel
+    double ox = 0, oy = 0, sx = 1.0, sy = 1.0; // image origin (screen) + dst->src scale
+    bool repeat = false;
+    switch (g_info.pos) {
+        case DWPOS_FILL:
+        case DWPOS_SPAN: {
+            double sc = std::max(Aw / iw, Ah / ih);
+            sx = sy = sc;
+            ox = area.left + (Aw - iw * sc) / 2;
+            oy = area.top + (Ah - ih * sc) / 2;
+            break;
+        }
+        case DWPOS_FIT: {
+            double sc = std::min(Aw / iw, Ah / ih);
+            sx = sy = sc;
+            ox = area.left + (Aw - iw * sc) / 2;
+            oy = area.top + (Ah - ih * sc) / 2;
+            break;
+        }
+        case DWPOS_STRETCH:
+            sx = Aw / iw;
+            sy = Ah / ih;
+            ox = (double)area.left;
+            oy = (double)area.top;
+            break;
+        case DWPOS_TILE:
+            repeat = true;
+            ox = area.left + std::floor((Aw - iw) / 2);
+            oy = area.top + std::floor((Ah - ih) / 2);
+            break;
+        case DWPOS_CENTER:
+        default:
+            ox = area.left + (Aw - iw) / 2;
+            oy = area.top + (Ah - ih) / 2;
+            break;
+    }
+
+    for (int y = 0; y < s.h; ++y) {
+        for (int x = 0; x < s.w; ++x) {
+            double fx = (rc.left + x - ox) / sx; // source coords (image px)
+            double fy = (rc.top + y - oy) / sy;
+            // store bottom-up like CaptureRect's DIB, matching ICO XOR order
+            BYTE* d = &s.px[((size_t)(s.h - 1 - y) * s.w + x) * 4];
+            double kx = 1.0 / sx, ky = 1.0 / sy; // source px covered by one dst px
+
+            auto inside = [&](double X, double Y) {
+                return X >= 0 && Y >= 0 && X < iw && Y < ih;
+            };
+            if (repeat) {
+                fx = std::fmod(fx, iw); if (fx < 0) fx += iw;
+                fy = std::fmod(fy, ih); if (fy < 0) fy += ih;
+            }
+            if (!inside(fx, fy) && !repeat) {
+                d[0] = backB; d[1] = backG; d[2] = backR; d[3] = 0xFF;
+                continue;
+            }
+
+            // area-weighted box filter over the covered source footprint:
+            // exact box when downscaling, reduces to bilinear when upscaling
+            auto span = [&](double start, double len, double lim, int& i0, double* wt, double& sum) {
+                int first = (int)std::floor(start);
+                int count = (int)std::ceil(start + len) - first;
+                if (count > 4096) count = 4096;
+                sum = 0;
+                for (int k = 0; k < count; ++k) {
+                    int idx = first + k;
+                    double lo = std::max((double)idx, start);
+                    double hi = std::min((double)idx + 1.0, start + len);
+                    double ov = hi - lo;
+                    wt[k] = 0;
+                    if (repeat) {
+                        if (ov > 0) { wt[k] = ov; sum += ov; }
+                    } else {
+                        if (idx < 0 || idx >= (int)lim || ov <= 0) continue;
+                        wt[k] = ov;
+                        sum += ov;
+                    }
+                }
+                i0 = first;
+                return count;
+            };
+            double wx[4096], wy[4096], swx = 0, swy = 0;
+            int ix0, iy0, cx, cy;
+            cx = span(fx, std::max(kx, 1e-9), iw, ix0, wx, swx);
+            cy = span(fy, std::max(ky, 1e-9), ih, iy0, wy, swy);
+            if (swx <= 0 || swy <= 0) {
+                d[0] = backB; d[1] = backG; d[2] = backR; d[3] = 0xFF;
+                continue;
+            }
+            long long bb = 0, gg = 0, rr = 0;
+            double tw = 0;
+            for (int yy = 0; yy < cy; ++yy) {
+                if (wy[yy] <= 0) continue;
+                int syi = iy0 + yy;
+                if (repeat) { syi %= (int)ih; if (syi < 0) syi += (int)ih; }
+                for (int xx = 0; xx < cx; ++xx) {
+                    if (wx[xx] <= 0) continue;
+                    int sxi = ix0 + xx;
+                    if (repeat) { sxi %= (int)iw; if (sxi < 0) sxi += (int)iw; }
+                    const BYTE* p = &g_info.px[((size_t)syi * g_info.w + sxi) * 4];
+                    double w = wx[xx] * wy[yy];
+                    bb += (long long)(p[0] * w); gg += (long long)(p[1] * w); rr += (long long)(p[2] * w);
+                    tw += w;
+                }
+            }
+            if (tw <= 0) {
+                d[0] = backB; d[1] = backG; d[2] = backR; d[3] = 0xFF;
+                continue;
+            }
+            d[0] = (BYTE)(bb / tw + 0.5); d[1] = (BYTE)(gg / tw + 0.5); d[2] = (BYTE)(rr / tw + 0.5); d[3] = 0xFF;
+        }
+    }
+    return true;
+}
+
+} // namespace wall
 
 // ------------------------------------------------------------------ logic --
 
@@ -480,17 +944,22 @@ void UpdateStatus(const std::wstring& s) {
     Log(L"status: %s", s.c_str());
 }
 
-std::wstring MakeStatus(int w, int h, const RECT& rc, bool unchanged) {
+std::wstring MakeStatus(int w, int h, const RECT& rc, bool unchanged, const wchar_t* mode) {
     SYSTEMTIME st;
     GetLocalTime(&st);
     wchar_t t[16];
     swprintf(t, 16, L"%02u:%02u:%02u", st.wHour, st.wMinute, st.wSecond);
-    std::wstring r = unchanged ? L"背景无变化 no change · 已伪装 camouflaged "
-                               : L"已伪装 camouflaged ";
-    r += std::to_wstring(w) + L"\u00d7" + std::to_wstring(h) + L" @ (" +
+    std::wstring r = unchanged ? L"背景无变化 no change · " : L"已伪装 camouflaged · ";
+    r += mode;
+    r += g_lnkPath.empty() ? L" · 文件夹" : L" · 快捷方式";
+    r += L" · " + std::to_wstring(w) + L"\u00d7" + std::to_wstring(h) + L" @ (" +
          std::to_wstring(rc.left) + L"," + std::to_wstring(rc.top) + L") · #" +
          std::to_wstring(g_updates) + L" · " + t;
     return r;
+}
+
+bool RectEq(const RECT& a, const RECT& b) {
+    return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
 }
 
 bool RectCovered(const RECT& rc, const std::set<DWORD>& expPids) {
@@ -501,74 +970,120 @@ bool RectCovered(const RECT& rc, const std::set<DWORD>& expPids) {
 
 bool DoCycle() {
     if (g_folder.empty()) return false;
-    std::wstring name = BaseName(g_folder);
+    std::vector<std::wstring> names = LocateNames();
     std::set<DWORD> expPids = ExplorerPids();
 
     FolderLoc loc;
-    if (!LocateOnDesktop(name, expPids, loc)) {
-        UpdateStatus(L"未能在桌面定位该文件夹（需要 explorer 桌面且图标可见）Folder not found on desktop");
+    if (!LocateOnDesktop(names, expPids, loc)) {
+        UpdateStatus(g_lnkPath.empty()
+                         ? L"未能在桌面定位该文件夹（需要 explorer 桌面且图标可见）Folder not found on desktop"
+                         : L"未能在桌面定位该快捷方式（需要 explorer 桌面且图标可见）Shortcut not found on desktop");
         return false;
     }
 
-    // While another window covers the target rect the true background is not
-    // visible: the folder is hidden behind it anyway, so pause refreshing and
-    // never sample through that window.
-    if (RectCovered(loc.iconRectScreen, expPids)) {
-        UpdateStatus(L"目标位置被窗口遮挡，暂停刷新（移开后自动恢复）Occluded by a window, paused");
-        return false;
-    }
-
-    RemoteListView rl;
-    if (!rl.Attach(loc.lv)) {
-        UpdateStatus(L"无法访问桌面列表视图 Cannot access desktop list view");
-        return false;
-    }
-
-    // Move the icon off any monitor, let the desktop repaint, capture the pure
-    // background (wallpaper engines render there too), then move it back.
-    POINT away{GetSystemMetrics(SM_XVIRTUALSCREEN) - 8192,
-               GetSystemMetrics(SM_YVIRTUALSCREEN) - 8192};
-    rl.SetPos(loc.index, away);
-    Sleep(kSettleMs);
+    const bool covered = RectCovered(loc.iconRectScreen, expPids);
     Shot s;
-    bool ok = CaptureRect(loc.iconRectScreen, s);
-    rl.SetPos(loc.index, loc.slot);
-    // Verify the icon really returned to its slot; desktop organizers
-    // (Fences etc.) can snap a moved icon to a different cell.
-    POINT back{};
-    for (int t = 0; t < 2; ++t) {
-        if (!rl.Pos(loc.index, back)) break;
-        if (std::abs(back.x - loc.slot.x) <= 2 && std::abs(back.y - loc.slot.y) <= 2) break;
+    bool fromFile = false;
+
+    // Preferred path: render the wallpaper FILE at the icon rect. Needs no
+    // icon moving and works while other windows cover the desktop.
+    if (wall::RefreshFor(loc.iconRectScreen)) {
+        // Drift probe: once trusted and visible, the live screen must still
+        // equal our last sample. A mismatch means the wallpaper changed or an
+        // engine renders dynamically -> fall back to real captures.
+        if (g_wallTrusted && !covered && g_lastW > 0 && !g_lastPx.empty() &&
+            RectEq(g_lastRect, loc.iconRectScreen)) {
+            Shot now;
+            if (CaptureRect(g_lastRect, now) && now.w == g_lastW && now.h == g_lastH) {
+                double d = wall::MeanDiff(now.px, g_lastPx);
+                if (d > 4.0) {
+                    g_wallTrusted = false;
+                    Log(L"wallpaper drift %.2f%% -> recalibrating from screen", d);
+                }
+            }
+        }
+        // Optimistically use the file even uncalibrated while covered: the
+        // icon is hidden behind a window anyway; calibrate once visible.
+        if (g_wallTrusted || covered) {
+            if (wall::SampleRect(loc.iconRectScreen, s)) fromFile = true;
+        }
+    }
+
+    if (!fromFile) {
+        // Fallback: capture the real desktop. Never sample through a covering
+        // window - the true background is not visible there.
+        if (covered) {
+            UpdateStatus(L"目标位置被窗口遮挡且壁纸文件不可用，暂停刷新（移开后自动恢复）Occluded, paused");
+            return false;
+        }
+        RemoteListView rl;
+        if (!rl.Attach(loc.lv)) {
+            UpdateStatus(L"无法访问桌面列表视图 Cannot access desktop list view");
+            return false;
+        }
+        // Move the icon off any monitor, let the desktop repaint, capture the
+        // pure background (wallpaper engines render there too), then restore.
+        POINT away{GetSystemMetrics(SM_XVIRTUALSCREEN) - 8192,
+                   GetSystemMetrics(SM_YVIRTUALSCREEN) - 8192};
+        rl.SetPos(loc.index, away);
+        Sleep(kSettleMs);
+        bool ok = CaptureRect(loc.iconRectScreen, s);
         rl.SetPos(loc.index, loc.slot);
+        // Verify the icon really returned to its slot; desktop organizers
+        // (Fences etc.) can snap a moved icon to a different cell.
+        POINT back{};
+        for (int t = 0; t < 2; ++t) {
+            if (!rl.Pos(loc.index, back)) break;
+            if (std::abs(back.x - loc.slot.x) <= 2 && std::abs(back.y - loc.slot.y) <= 2) break;
+            rl.SetPos(loc.index, loc.slot);
+        }
+        if (std::abs(back.x - loc.slot.x) > 2 || std::abs(back.y - loc.slot.y) > 2)
+            Log(L"restore mismatch: pos (%d,%d) wanted (%d,%d)", back.x, back.y,
+                loc.slot.x, loc.slot.y);
+        if (!ok) {
+            UpdateStatus(L"屏幕截图失败 Screen capture failed");
+            return false;
+        }
+        // Calibrate: does the file-rendered wallpaper match reality? If yes,
+        // later cycles can switch to the (much cheaper, occlusion-proof)
+        // file path; a wallpaper engine fails this check permanently.
+        Shot fs;
+        if (wall::RefreshFor(loc.iconRectScreen) && wall::SampleRect(loc.iconRectScreen, fs) &&
+            fs.w == s.w && fs.h == s.h) {
+            double d = wall::MeanDiff(fs.px, s.px);
+            g_wallTrusted = d < 4.0;
+            Log(L"wallpaper-file calibration diff %.2f%% -> %s", d,
+                g_wallTrusted ? L"trusted" : L"untrusted");
+        } else {
+            g_wallTrusted = false;
+        }
     }
-    if (std::abs(back.x - loc.slot.x) > 2 || std::abs(back.y - loc.slot.y) > 2)
-        Log(L"restore mismatch: pos (%d,%d) wanted (%d,%d)", back.x, back.y,
-            loc.slot.x, loc.slot.y);
-    if (!ok) {
-        UpdateStatus(L"屏幕截图失败 Screen capture failed");
-        return false;
-    }
+
     g_lastRect = loc.iconRectScreen;
 
-    bool unchanged = (s.w == g_lastW && s.h == g_lastH && s.px == g_lastPx);
+    const bool unchanged = (s.w == g_lastW && s.h == g_lastH && s.px == g_lastPx);
+    const wchar_t* mode = fromFile ? (g_wallTrusted ? L"壁纸文件 wallpaper-file"
+                                                   : L"壁纸文件(未校准) wallpaper-file (uncalibrated)")
+                                  : L"截屏 screenshot";
     if (unchanged) {
-        UpdateStatus(MakeStatus(s.w, s.h, loc.iconRectScreen, true));
+        UpdateStatus(MakeStatus(s.w, s.h, loc.iconRectScreen, true, mode));
         return true;
     }
 
-    std::wstring ico = g_folder + L"\\wall_icon_" + std::to_wstring(g_iconGen % kIconSlots) + L".ico";
+    std::wstring ico = g_artifactsDir + L"\\wall_icon_" + std::to_wstring(g_iconGen % kIconSlots) + L".ico";
     if (!WriteIcoFile(ico, s)) {
         UpdateStatus(L"写入 ICO 文件失败 Failed to write .ico");
         return false;
     }
-    ApplyFolderIcon(g_folder, ico);
+    if (!g_lnkPath.empty()) SetLnkIconLocation(g_lnkPath, ico);
+    else ApplyFolderIcon(g_folder, ico);
     g_iconGen++;
     g_lastW = s.w;
     g_lastH = s.h;
     g_lastPx = std::move(s.px);
     g_updates++;
-    UpdateStatus(MakeStatus(g_lastW, g_lastH, loc.iconRectScreen, false));
-    Log(L"icon updated #%llu %ls", g_updates, ico.c_str());
+    UpdateStatus(MakeStatus(g_lastW, g_lastH, loc.iconRectScreen, false, mode));
+    Log(L"icon updated #%llu %ls (%s)", g_updates, ico.c_str(), mode);
     return true;
 }
 
@@ -638,7 +1153,16 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (id == IDB_HIDE && code == BN_CLICKED) {
             ShowWindow(h, SW_HIDE);
         } else if (id == IDB_RESTORE && code == BN_CLICKED) {
-            RestoreFolderIcon(g_folder);
+            if (!g_lnkPath.empty()) {
+                ResetLnkIcon(g_lnkPath);
+                DeleteArtifacts();
+                g_lastW = 0;
+                g_lastH = 0;
+                g_lastPx.clear();
+                g_wallTrusted = false;
+            } else {
+                RestoreFolderIcon(g_folder);
+            }
             UpdateStatus(L"已恢复默认图标 Icon restored（后台继续伪装中）");
         } else if (id == IDB_EXIT && code == BN_CLICKED) {
             DestroyWindow(h);
@@ -705,15 +1229,19 @@ int RunLocate() {
     if (con) freopen("CONOUT$", "w", stdout);
     printf("HideFoldersUsingFolderIcons --locate (read-only)\n");
     printf("folder : %ls\n", g_folder.c_str());
-    Log(L"--locate start folder=%ls", g_folder.c_str());
+    if (!g_lnkPath.empty())
+        printf("shortcut: %ls\ntarget : %ls\n", g_lnkPath.c_str(), g_folder.c_str());
+    printf("mode   : %s\n", g_lnkPath.empty() ? "desktop.ini folder icon"
+                                              : "shortcut (.lnk) icon");
+    Log(L"--locate start folder=%ls shortcut=%ls", g_folder.c_str(), g_lnkPath.c_str());
 
-    std::wstring name = BaseName(g_folder);
+    std::vector<std::wstring> names = LocateNames();
     RECT prev{};
     bool have = false;
     for (int k = 0; k < 5; ++k) {
         std::set<DWORD> pids = ExplorerPids();
         FolderLoc loc;
-        if (LocateOnDesktop(name, pids, loc)) {
+        if (LocateOnDesktop(names, pids, loc)) {
             char cls[64] = {}, rootCls[64] = {};
             GetClassNameA(loc.lv, cls, 63);
             HWND root = GetAncestor(loc.lv, GA_ROOT);
@@ -743,7 +1271,10 @@ int RunOnce() {
     if (con) freopen("CONOUT$", "w", stdout);
     printf("HideFoldersUsingFolderIcons --once\n");
     printf("folder : %ls\ninterval: %u ms\n", g_folder.c_str(), g_intervalMs);
-    Log(L"--once start folder=%ls", g_folder.c_str());
+    if (!g_lnkPath.empty())
+        printf("shortcut: %ls\nartifacts: %ls\nmode   : shortcut (.lnk) icon\n",
+               g_lnkPath.c_str(), g_artifactsDir.c_str());
+    Log(L"--once start folder=%ls shortcut=%ls", g_folder.c_str(), g_lnkPath.c_str());
 
     bool ok1 = DoCycle();
     printf("pass 1 : %s\n", ok1 ? "ok" : "no update (occluded / not found)");
@@ -757,13 +1288,7 @@ int RunOnce() {
         Shot now;
         if (CaptureRect(g_lastRect, now) && now.w == g_lastW && now.h == g_lastH &&
             now.px.size() == g_lastPx.size()) {
-            double diff = 0;
-            size_t px = now.px.size() / 4;
-            for (size_t i = 0; i < now.px.size(); i += 4)
-                diff += std::abs((int)now.px[i] - (int)g_lastPx[i]) +
-                        std::abs((int)now.px[i + 1] - (int)g_lastPx[i + 1]) +
-                        std::abs((int)now.px[i + 2] - (int)g_lastPx[i + 2]);
-            diff = 100.0 * diff / ((double)px * 3 * 255);
+            double diff = wall::MeanDiff(now.px, g_lastPx);
             printf("verify : mean pixel diff = %.2f%% (%s)\n", diff,
                    diff < 3.0 ? "PASS: folder icon matches the wallpaper"
                               : "CHECK: shell may not have refreshed the icon yet");
@@ -789,13 +1314,15 @@ void EnableDpiAwareness() {
 void ShowHelp() {
     MessageBoxW(nullptr,
         L"用法 Usage:\n"
-        L"  HideFoldersUsingFolderIcons.exe [文件夹路径 folder] [选项 options]\n\n"
+        L"  HideFoldersUsingFolderIcons.exe [文件夹/快捷方式 folder or .lnk] [选项 options]\n\n"
         L"  --interval <ms>  刷新间隔 refresh interval (default 200)\n"
         L"  --once           采样一次并验证后退出 run one pass and exit (debug)\n"
         L"  --locate         只定位不修改 locate only, no changes (debug)\n"
         L"  --log            写日志 log to %TEMP%\\HFUFO_log.txt\n\n"
         L"默认目标为 exe 所在文件夹。\n"
-        L"By default the folder containing the exe is camouflaged.",
+        L"若桌面上存在指向该文件夹的快捷方式，自动改为伪装快捷方式图标。\n"
+        L"By default the folder containing the exe is camouflaged. A desktop\n"
+        L"shortcut pointing at the folder is camouflaged instead when present.",
         L"HideFoldersUsingFolderIcons", MB_ICONINFORMATION);
 }
 
@@ -804,10 +1331,12 @@ void ShowHelp() {
 int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     g_inst = hInst;
     g_selfPid = GetCurrentProcessId();
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     EnableDpiAwareness();
     INITCOMMONCONTROLSEX icc{sizeof icc, ICC_WIN95_CLASSES};
     InitCommonControlsEx(&icc);
     ParseCommandLine();
+    InitTargetMode();
 
     if (g_helpOnly) {
         ShowHelp();

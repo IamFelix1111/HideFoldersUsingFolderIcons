@@ -16,4 +16,4 @@ elseif(MINGW)
     target_link_options(HideFoldersUsingFolderIcons PRIVATE -municode)
 endif()
 
-target_link_libraries(HideFoldersUsingFolderIcons PRIVATE user32 gdi32 comctl32 shell32 dwmapi)
+target_link_libraries(HideFoldersUsingFolderIcons PRIVATE user32 gdi32 comctl32 shell32 dwmapi ole32 windowscodecs)
