@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: # manual test build: artifact only, no release
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $tag = "${env:GITHUB_REF_NAME}"
+          $isTag = $tag -like 'v*'
+          $ver = if ($isTag) { $tag } else { "dev-$($env:GITHUB_SHA.Substring(0,7))" }
+          $zip = "HideFoldersUsingFolderIcons-$ver-win64.zip"
+          Compress-Archive -Path 'build\HideFoldersUsingFolderIcons.exe', 'README.md', 'LICENSE' `
+            -DestinationPath $zip
+          "zip=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "isTag=$isTag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.zip }}
+          path: ${{ env.zip }}
+
+      - name: Create GitHub release
+        if: env.isTag == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${env:GITHUB_REF_NAME}" `
+            --repo "$env:GITHUB_REPOSITORY" `
+            --title "HideFoldersUsingFolderIcons $env:GITHUB_REF_NAME" `
+            --generate-notes `
+            "${env:zip}#Windows x64 executable (MSVC Release)"

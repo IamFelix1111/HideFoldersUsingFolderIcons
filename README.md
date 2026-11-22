@@ -85,6 +85,8 @@ HideFoldersUsingFolderIcons.exe ("C:\Users\Administrator\Desktop\" + [char]0x300
 
 ## 构建 Build
 
+也可以直接从 [Releases](https://github.com/IamFelix1111/HideFoldersUsingFolderIcons/releases) 下载预编译的 `win64.zip`（Actions 用 MSVC Release 构建，含 exe / README / LICENSE）。
+
 需要 CMake ≥ 3.20 和 MSVC 或 MinGW-w64（Windows 10/11）：
 
 ```bash
