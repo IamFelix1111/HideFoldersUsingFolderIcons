@@ -960,6 +960,33 @@ std::vector<HWND> CaptureCandidates(const std::vector<FolderLoc>& locs) {
 
 // One full probe pass: apply probe icons, wait for the repaint, then hunt
 // the probe pixels in every candidate window. Fills `out` per target.
+// Simulate the Win+D "show desktop" chord (toggles back on a second press).
+void PressWinD() {
+    INPUT in[4]{};
+    for (auto& i : in) i.type = INPUT_KEYBOARD;
+    in[0].ki.wVk = VK_LWIN;
+    in[1].ki.wVk = 'D';
+    in[2].ki.wVk = 'D';
+    in[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    in[3].ki.wVk = VK_LWIN;
+    in[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(4, in, sizeof(INPUT));
+}
+
+// Organizers don't reload a changed icon until the desktop is visible and
+// refreshed: switch to the desktop (Win+D) and send F5, exactly like the
+// manual fix. The caller toggles windows back afterwards.
+void ShowDesktopAndRefresh() {
+    PressWinD();
+    Sleep(350); // let the switch settle so F5 reaches the desktop
+    INPUT f5[2]{};
+    for (auto& i : f5) i.type = INPUT_KEYBOARD;
+    f5[0].ki.wVk = VK_F5;
+    f5[1].ki.wVk = VK_F5;
+    f5[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(2, f5, sizeof(INPUT));
+}
+
 bool RunProbePass(const std::vector<FolderLoc>& locs, std::vector<ProbeHit>& out) {
     std::vector<int> wantIds;
     const int n = (int)g_targets.size();
@@ -970,8 +997,13 @@ bool RunProbePass(const std::vector<FolderLoc>& locs, std::vector<ProbeHit>& out
     }
     if (wantIds.empty()) return false;
 
+    // force icon reload on organizers: desktop visible + F5 refresh
+    Log(L"probe: show desktop + F5 refresh");
+    ShowDesktopAndRefresh();
+
     const std::vector<HWND> cands = CaptureCandidates(locs);
-    for (int attempt = 0; attempt < 6; ++attempt) { // repaint can lag a bit
+    bool ok = false;
+    for (int attempt = 0; attempt < 6 && !ok; ++attempt) { // repaint can lag a bit
         Sleep(250);
         for (HWND c : cands) {
             Shot s;
@@ -987,11 +1019,12 @@ bool RunProbePass(const std::vector<FolderLoc>& locs, std::vector<ProbeHit>& out
                 if (!have) out.push_back(h);
             }
         }
-        if (out.size() == wantIds.size()) return true; // all found
+        if (out.size() == wantIds.size()) ok = true; // all found
         // some renderers never draw a target (desktop.ini under organizers):
         // accept a partial result after a second attempt
-        if (!out.empty() && attempt >= 1) return true;
+        else if (!out.empty() && attempt >= 1) ok = true;
     }
+    PressWinD(); // bring the user's windows back
     return !out.empty();
 }
 
