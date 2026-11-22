@@ -8,7 +8,7 @@ A Windows (C++/Win32) utility that **hides a desktop folder in plain sight**: it
 
 - ✅ 定时（默认 200ms，可调）采样壁纸并更新文件夹图标，动态壁纸（Wallpaper Engine 等）也能跟上
 - ✅ **壁纸文件直读**：优先经 `IDesktopWallpaper` + WIC 直接解码壁纸文件采样，桌面被窗口遮挡时也照常出图；不可用时自动回退截图
-- ✅ **快捷方式伪装**：桌面整理工具不认 desktop.ini 图标时，可伪装指向文件夹的 `.lnk` 快捷方式（自动发现或显式传入）
+- ✅ **快捷方式伪装**：桌面整理工具不认 desktop.ini 图标时，可伪装指向文件夹的 `.lnk` 快捷方式（自动发现**全部**指向该文件夹的快捷方式并逐一定位伪装，也可显式传入单个 `.lnk`）
 - ✅ 兼容使用列表视图的桌面整理工具（Fences、腾讯桌面整理等），壁纸来源不限（壁纸引擎 / 幻灯片 / 普通壁纸均可）
 - ✅ 运行时**无托盘图标**；点窗口 ✕ 只是**隐藏窗口**，程序继续后台刷新
 - ✅ **再次运行 exe 即可唤出窗口**（单实例：第二次启动会激活已运行的实例）
@@ -33,16 +33,16 @@ A Windows (C++/Win32) utility that **hides a desktop folder in plain sight**: it
 
 部分桌面整理工具不渲染 `desktop.ini` 的自定义文件夹图标，但**一定会渲染快捷方式的图标**。此时伪装"指向该文件夹的桌面快捷方式"即可：
 
-- 把快捷方式（如 `　.lnk`，目标为隐身文件夹）放在桌面，程序运行时在目标文件夹内启动；
-- 程序发现桌面上有指向目标文件夹的快捷方式会**自动进入快捷方式模式**，也可以显式把 `.lnk` 路径作为第一个参数传入；
-- 图标通过 `IShellLink::SetIconLocation` 写入快捷方式，`wall_icon_*.ico` 生成在目标文件夹（或 exe 目录 / `%TEMP%\HFUFO_icons\`）。
+- 把快捷方式（如 `　.lnk`、`　　.lnk` …，目标均为隐身文件夹）放在桌面，程序运行时在目标文件夹内启动；
+- 程序会自动发现桌面上**所有**指向目标文件夹的快捷方式，**连同文件夹本身一起伪装**：每个图标分别采样**各自位置**的壁纸并写入各自专属的 `wall_icon_*.ico`，不会互相覆盖；也可以显式把某个 `.lnk` 路径作为第一个参数传入，只伪装该快捷方式；
+- 快捷方式图标通过 `IShellLink::SetIconLocation` 写入，`wall_icon_*.ico` 生成在目标文件夹（或 exe 目录 / `%TEMP%\HFUFO_icons\`）；「恢复默认图标」会还原文件夹与全部快捷方式。
 
 注意两点：
 
 - Windows 会在快捷方式图标左下角叠加**小箭头**（系统行为，`IconLocation` 无法去除），该角会有轻微可见痕迹；
-- 若桌面上同时存在**同名**的文件夹和快捷方式（如 `　` 与 `　.lnk`），定位可能产生歧义——建议二者名称错开，或显式传入要伪装的 `.lnk` 路径。
+- 若文件夹与某个快捷方式的**显示名完全相同**（如文件夹 `　` 与 `　.lnk`），二者的图标矩形都能各自定位，但 `desktop.ini` 只能记录一个 ico——文件夹图标可能取到快捷方式位置的壁纸（桌面整理工具不渲染 desktop.ini，通常无实际影响；纯 explorer 桌面下建议二者名称错开）。
 
-状态栏会显示当前模式：采样来源（壁纸文件 / 壁纸文件(未校准) / 截屏）+ 目标类型（快捷方式 / 文件夹）+ 尺寸与位置等。
+状态栏会显示：采样来源（壁纸文件 / 壁纸文件(未校准) / 截屏）+ 本轮匹配到的图标数量（更新 / 无变化）+ 尺寸与位置等。
 
 ## 命令行 Command line
 
@@ -52,7 +52,7 @@ HideFoldersUsingFolderIcons.exe [目标路径] [--interval <ms>] [--once] [--loc
 
 | 参数 | 说明 |
 | --- | --- |
-| `目标路径` | 文件夹路径或桌面快捷方式（`.lnk`）路径。默认为 exe 所在文件夹；目标为 `.lnk` 或桌面上存在指向该文件夹的快捷方式时，自动进入快捷方式模式 |
+| `目标路径` | 文件夹路径或桌面快捷方式（`.lnk`）路径。默认为 exe 所在文件夹；传入文件夹时会自动伪装它本身与桌面上**所有**指向它的快捷方式，传入 `.lnk` 时只伪装该快捷方式 |
 | `--interval <ms>` | 刷新间隔，默认 200，范围 50–60000（动态壁纸建议 100–500） |
 | `--once` | 只跑一轮采样并自验证后退出（调试用；控制台输出结论） |
 | `--locate` | 只定位目标图标并观察其位置是否稳定，不做任何修改（调试用） |
@@ -67,16 +67,16 @@ HideFoldersUsingFolderIcons.exe ("C:\Users\Administrator\Desktop\" + [char]0x300
 
 ## 原理 How it works
 
-1. **定位图标**：在 explorer 桌面视图（`Progman/WorkerW → SHELLDLL_DefView → SysListView32`，以及桌面整理工具的列表视图）里，用跨进程 `VirtualAllocEx` + `LVM_*` 消息按显示名找到目标文件夹，取其图标矩形（`LVM_GETITEMRECT` / `LVIR_ICON`）。
+1. **定位图标**：在 explorer 桌面视图（`Progman/WorkerW → SHELLDLL_DefView → SysListView32`，以及桌面整理工具的列表视图）里，用跨进程 `VirtualAllocEx` + `LVM_*` 消息按显示名找到**所有**匹配项（文件夹本身 + 每个指向它的快捷方式），逐一取其图标矩形（`LVM_GETITEMRECT` / `LVIR_ICON`）。
 2. **采样背景（两种方式，自动选择）**：
    - **壁纸文件直读（优先）**：通过 `IDesktopWallpaper` 拿到当前壁纸文件与铺放方式（FILL / FIT / STRETCH / CENTER / TILE / SPAN），WIC 解码后按面积加权盒式滤波直接采样目标矩形对应的壁纸区域。**桌面被窗口完全遮挡时也能照常出图**；纯色桌面取 `IDesktopWallpaper::GetBackgroundColor`。可见时会用一次真实截图自动**校准**（与文件采样逐像素比对，差异 < 4% 才信任文件模式；壁纸被换或动态壁纸引擎接管时自动回退截图模式）。
    - **截图回退**：`LVM_SETITEMPOSITION32` 把该图标暂时移出屏幕 → 等待约 60ms 重绘 → `BitBlt` 截取该矩形（此时就是纯背景，包含壁纸引擎实际渲染的画面）→ 把图标移回原位（移回后会校验位置，被桌面整理工具重排时自动纠正）。采样前会先检测目标位置是否被其它窗口遮挡；遮挡且文件模式不可用时本轮跳过、绝不把遮挡窗口的画面写进图标。
-3. **生成图标**：与上次采样逐字节比较，有变化才把 32bpp BGRA 数据写成单帧 `.ico`（文件名在 `wall_icon_0..3.ico` 间轮换，规避 shell 图标缓存）。
-4. **应用图标（两种目标，自动识别）**：
+3. **生成图标**：每个图标矩形的采样与上次**逐字节比较**（按矩形分别缓存），有变化才把 32bpp BGRA 数据写成单帧 `.ico`（文件名在 `wall_icon_0..7.ico` 间轮换，规避 shell 图标缓存）。
+4. **应用图标（按匹配到的显示名分发）**：
+   - **快捷方式**：`IShellLink::SetIconLocation` 修改每个显示名匹配的桌面 `.lnk`，保存后 `SHChangeNotify` 刷新。**桌面整理工具改用快捷方式图标伪装**（部分工具不渲染 desktop.ini 自定义图标，但都会正常渲染 .lnk 的 IconLocation）。
    - **文件夹**：写入 `desktop.ini`（UTF-16）`[.ShellClassInfo] IconResource=<ico>,0`，设置 `desktop.ini` 隐藏+系统属性、文件夹系统属性，并 `SHChangeNotify(SHCNE_UPDATEITEM/UPDATEDIR)` 通知桌面刷新。
-   - **快捷方式**：`IShellLink::SetIconLocation` 修改指向该文件夹的桌面 `.lnk`，保存后 `SHChangeNotify` 刷新。**桌面整理工具改用快捷方式图标伪装**（部分工具不渲染 desktop.ini 自定义图标，但都会正常渲染 .lnk 的 IconLocation）。
 
-生成的 `wall_icon_0..3.ico` 存放位置：优先目标文件夹；exe 不在桌面时存 exe 所在目录；都不行时落到 `%TEMP%\HFUFO_icons\`。文件夹模式还会写 `desktop.ini`（均在"隐身"文件夹里，不影响观感）。
+生成的 `wall_icon_*.ico` 存放位置：优先目标文件夹；exe 不在桌面时存 exe 所在目录；都不行时落到 `%TEMP%\HFUFO_icons\`。文件夹模式还会写 `desktop.ini`（均在"隐身"文件夹里，不影响观感）。
 
 窗口行为：单实例命名互斥体 + 自定义窗口消息；关闭 = `SW_HIDE`；二次启动 → 唤出已有实例窗口后自身退出。
 
