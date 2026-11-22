@@ -765,6 +765,7 @@ void DeleteArtifacts() { DeleteArtifactsIn(g_artifactsDir); }
 
 // -------------------------------------------------------- probe calibration --
 // Desktop organizers decide themselves where icons render - list-view rects
+void UpdateStatus(const std::wstring& s); // defined later; marker needs it
 // can be plain wrong once an organizer is active - and some organizers hide
 // the shortcut arrow overlay too. The only source that is always right is
 // what the desktop actually PAINTS: temporarily set every target's icon to a
@@ -997,6 +998,79 @@ void ShowDesktopAndRefresh() {
     SendInput(2, f5, sizeof(INPUT));
 }
 
+// --- "please refresh manually" prompt --------------------------------------
+// If the synthetic F5 didn't make the organizer reload the icons, the user
+// can do it by hand: a small topmost window asks for it while the capture
+// loop below keeps scanning for the probe markers.
+namespace prompt {
+wchar_t kCls[] = L"HFUFO_prompt";
+HWND g_w = nullptr;
+
+LRESULT CALLBACK Prc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        SetBkMode(dc, TRANSPARENT);
+        HFONT f = (HFONT)CreateFontW(-26, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                                     0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
+        HFONT of = (HFONT)SelectObject(dc, f);
+        SetTextColor(dc, RGB(0, 0, 0));
+        DrawTextW(dc, L"请手动刷新桌面：在桌面按 F5\nPress F5 on the desktop", -1, &rc,
+                  DT_CENTER | DT_VCENTER | DT_WORDBREAK);
+        SelectObject(dc, of);
+        DeleteObject(f);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    if (m == WM_ERASEBKGND) {
+        RECT rc;
+        GetClientRect(h, &rc);
+        HBRUSH b = CreateSolidBrush(RGB(255, 250, 205));
+        FillRect((HDC)w, &rc, b);
+        DeleteObject(b);
+        return 1;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+void Show() {
+    if (!g_w) {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = Prc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = kCls;
+        RegisterClassW(&wc);
+        const int w = 460, h = 92;
+        const int sx = GetSystemMetrics(SM_CXSCREEN), sy = GetSystemMetrics(SM_CYSCREEN);
+        g_w = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, kCls, L"",
+                              WS_POPUP | WS_BORDER, (sx - w) / 2, sy - h - 140, w, h,
+                              nullptr, nullptr, wc.hInstance, nullptr);
+    }
+    ShowWindow(g_w, SW_SHOWNOACTIVATE);
+    UpdateWindow(g_w);
+}
+
+void Hide() {
+    if (g_w) ShowWindow(g_w, SW_HIDE);
+}
+} // namespace prompt
+
+// Sleep while keeping windows alive (prompt painting, main dialog input).
+void PumpSleep(int totalMs) {
+    for (int t = 0; t < totalMs; t += 50) {
+        MSG m;
+        while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
+            if (g_mainWnd && IsDialogMessageW(g_mainWnd, &m)) continue;
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+        Sleep(50);
+    }
+}
+
 bool RunProbePass(const std::vector<FolderLoc>& locs, std::vector<ProbeHit>& out) {
     std::vector<int> wantIds;
     const int n = (int)g_targets.size();
@@ -1010,11 +1084,15 @@ bool RunProbePass(const std::vector<FolderLoc>& locs, std::vector<ProbeHit>& out
     // force icon reload on organizers: desktop visible + F5 refresh
     Log(L"probe: show desktop + F5 refresh");
     ShowDesktopAndRefresh();
+    // if the synthetic F5 didn't take effect the user can refresh by hand:
+    // ask for it and keep capturing until the markers really show up
+    prompt::Show();
+    UpdateStatus(L"探针校准中：如长时间无反应，请在桌面手动按 F5 Probe: press F5 on the desktop");
 
     const std::vector<HWND> cands = CaptureCandidates(locs);
     bool ok = false;
-    for (int attempt = 0; attempt < 6 && !ok; ++attempt) { // repaint can lag a bit
-        Sleep(250);
+    for (int attempt = 0; attempt < 120 && !ok; ++attempt) { // up to ~30s
+        PumpSleep(250);
         for (HWND c : cands) {
             Shot s;
             if (!CaptureWindowClient(c, s)) continue;
@@ -1034,6 +1112,7 @@ bool RunProbePass(const std::vector<FolderLoc>& locs, std::vector<ProbeHit>& out
         // accept a partial result after a second attempt
         else if (!out.empty() && attempt >= 1) ok = true;
     }
+    prompt::Hide();
     PressWinD(); // bring the user's windows back
     return !out.empty();
 }
@@ -1397,7 +1476,7 @@ bool probeFoundIn(int ti) {
     return false;
 }
 
-bool DoCycle() {
+static bool DoCycleInner() {
     if (g_folder.empty() || g_targets.empty()) return false;
     std::vector<std::wstring> names = LocateNames();
     std::set<DWORD> expPids = ExplorerPids();
@@ -1599,6 +1678,17 @@ bool DoCycle() {
     }
     UpdateStatus(MakeStatus((int)locs.size(), updated, unchangedCount, lastW, lastH, lastRc, mode));
     return true;
+}
+
+// Reentrancy guard: the probe pass pumps messages while waiting for a manual
+// desktop refresh, which can dispatch a WM_TIMER that calls DoCycle again.
+bool DoCycle() {
+    static bool busy = false;
+    if (busy) return true;
+    busy = true;
+    bool r = DoCycleInner();
+    busy = false;
+    return r;
 }
 
 // -------------------------------------------------------------------- UI --
