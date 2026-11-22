@@ -40,7 +40,7 @@ A Windows (C++/Win32) utility that **hides a desktop folder in plain sight**: it
 注意两点：
 
 - Windows 会在快捷方式图标左下角叠加**小箭头**（系统行为，`IconLocation` 无法去除），该角会有轻微可见痕迹；
-- 若文件夹与某个快捷方式的**显示名完全相同**（如文件夹 `　` 与 `　.lnk`），二者的图标矩形都能各自定位，但 `desktop.ini` 只能记录一个 ico——文件夹图标可能取到快捷方式位置的壁纸（桌面整理工具不渲染 desktop.ini，通常无实际影响；纯 explorer 桌面下建议二者名称错开）。
+- 若文件夹与某个快捷方式的**显示名完全相同**（如文件夹 `　` 与 `　.lnk`），程序通过快捷方式图标左下角**小箭头的 overlay 状态位**（`LVM_GETITEMSTATE` / `LVIS_OVERLAYMASK`）自动区分二者：快捷方式图标取快捷方式所在位置的壁纸，`desktop.ini` 取文件夹所在位置的壁纸，互不串位。
 
 状态栏会显示：采样来源（壁纸文件 / 壁纸文件(未校准) / 截屏）+ 本轮匹配到的图标数量（更新 / 无变化）+ 尺寸与位置等。
 
@@ -67,7 +67,7 @@ HideFoldersUsingFolderIcons.exe ("C:\Users\Administrator\Desktop\" + [char]0x300
 
 ## 原理 How it works
 
-1. **定位图标**：在 explorer 桌面视图（`Progman/WorkerW → SHELLDLL_DefView → SysListView32`，以及桌面整理工具的列表视图）里，用跨进程 `VirtualAllocEx` + `LVM_*` 消息按显示名找到**所有**匹配项（文件夹本身 + 每个指向它的快捷方式），逐一取其图标矩形（`LVM_GETITEMRECT` / `LVIR_ICON`）。
+1. **定位图标**：在 explorer 桌面视图（`Progman/WorkerW → SHELLDLL_DefView → SysListView32`，以及桌面整理工具的列表视图）里，用跨进程 `VirtualAllocEx` + `LVM_*` 消息按显示名找到**所有**匹配项（文件夹本身 + 每个指向它的快捷方式），逐一取其图标矩形（`LVM_GETITEMRECT` / `LVIR_ICON`）；同名项（文件夹 vs 快捷方式）再以 **overlay 状态位**（`LVM_GETITEMSTATE`，快捷方式带小箭头 overlay）区分，确保各自采样各自位置。
 2. **采样背景（两种方式，自动选择）**：
    - **壁纸文件直读（优先）**：通过 `IDesktopWallpaper` 拿到当前壁纸文件与铺放方式（FILL / FIT / STRETCH / CENTER / TILE / SPAN），WIC 解码后按面积加权盒式滤波直接采样目标矩形对应的壁纸区域。**桌面被窗口完全遮挡时也能照常出图**；纯色桌面取 `IDesktopWallpaper::GetBackgroundColor`。可见时会用一次真实截图自动**校准**（与文件采样逐像素比对，差异 < 4% 才信任文件模式；壁纸被换或动态壁纸引擎接管时自动回退截图模式）。
    - **截图回退**：`LVM_SETITEMPOSITION32` 把该图标暂时移出屏幕 → 等待约 60ms 重绘 → `BitBlt` 截取该矩形（此时就是纯背景，包含壁纸引擎实际渲染的画面）→ 把图标移回原位（移回后会校验位置，被桌面整理工具重排时自动纠正）。采样前会先检测目标位置是否被其它窗口遮挡；遮挡且文件模式不可用时本轮跳过、绝不把遮挡窗口的画面写进图标。

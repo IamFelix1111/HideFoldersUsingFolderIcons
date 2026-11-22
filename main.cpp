@@ -209,6 +209,12 @@ public:
 
     int Count() const { return (int)Snd(LVM_GETITEMCOUNT, 0, 0); }
 
+    // Overlay bits come back in the return value, so this needs no remote
+    // buffer: shortcuts carry the arrow overlay, folders none.
+    DWORD OverlayState(int i) {
+        return (DWORD)Snd(LVM_GETITEMSTATE, (WPARAM)i, (LPARAM)LVIS_OVERLAYMASK);
+    }
+
     bool Text(int i, std::wstring& out) {
         LVITEMW lvi{};
         lvi.mask = LVIF_TEXT;
@@ -314,6 +320,7 @@ struct FolderLoc {
     RECT iconRectScreen{};
     POINT slot{};
     std::wstring text;       // matched desktop display name
+    DWORD overlay = 0;       // LVIS_OVERLAYMASK bits (shortcut arrow)
 };
 
 // Collect EVERY desktop item whose text matches one of `names`.
@@ -347,9 +354,10 @@ bool LocateAllOnDesktop(const std::vector<std::wstring>& names, const std::set<D
                     f.iconRectScreen = rc;
                     f.slot = pt;
                     f.text = t;
+                    f.overlay = rl.OverlayState(i);
                     outs.push_back(f);
-                    Log(L"located '%s' item %d in %dx%d view, icon rect (%d,%d)-(%d,%d)",
-                        t.c_str(), i, n, n, rc.left, rc.top, rc.right, rc.bottom);
+                    Log(L"located '%s' item %d in %dx%d view, icon rect (%d,%d)-(%d,%d), overlay 0x%X",
+                        t.c_str(), i, n, n, rc.left, rc.top, rc.right, rc.bottom, f.overlay);
                 }
             }
         }
@@ -468,9 +476,14 @@ bool WriteIcoFile(const std::wstring& path, const Shot& s) {
 // -------------------------------------------------------------- shell bits --
 
 void WriteUtf16File(const std::wstring& path, const std::wstring& text) {
+    // CREATE_ALWAYS on an existing HIDDEN/SYSTEM file (desktop.ini!) fails
+    // with ERROR_ACCESS_DENIED unless the call carries those attributes too.
     HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
-                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return;
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        Log(L"write failed '%s' err=%lu", path.c_str(), GetLastError());
+        return;
+    }
     DWORD w = 0;
     WORD bom = 0xFEFF;
     WriteFile(h, &bom, 2, &w, nullptr);
@@ -686,21 +699,49 @@ std::vector<std::wstring> LocateNames() {
     return v;
 }
 
-// Apply one sampled icon to every target whose desktop display name equals
-// `matched`: rewrite each matching shortcut's IconLocation, and desktop.ini
-// for a matching folder name.
-void ApplyToTargets(const std::wstring& matched, const std::wstring& ico) {
-    for (const auto& t : g_targets) {
-        if (!t.isLnk) continue;
-        if (lstrcmpiW(matched.c_str(), t.name.c_str()) == 0 ||
-            lstrcmpiW(matched.c_str(), t.nameExt.c_str()) == 0)
-            SetLnkIconLocation(t.lnk, ico);
+// Does target t display under desktop text `text`?
+bool NameMatch(const CamTarget& t, const std::wstring& text) {
+    return lstrcmpiW(text.c_str(), t.name.c_str()) == 0 ||
+           (t.isLnk && lstrcmpiW(text.c_str(), t.nameExt.c_str()) == 0);
+}
+
+// Apply one sampled icon to every target belonging to located item `loc`.
+// When several items share a display name (a folder and a shortcut can show
+// identical text, e.g. both "　"), the shortcut-arrow OVERLAY tells them
+// apart: the shortcut item carries overlay bits, the folder does not. That
+// keeps each icon's content at its own position instead of a sibling's.
+void ApplyToTargets(const FolderLoc& loc, const std::wstring& ico,
+                    const std::vector<FolderLoc>& locs) {
+    int sameLocs = 0, shortcutLocs = 0, folderLocs = 0, shortcutTargets = 0, folderTargets = 0;
+    for (const auto& o : locs) {
+        if (lstrcmpiW(o.text.c_str(), loc.text.c_str()) != 0) continue;
+        ++sameLocs;
+        if (o.overlay & LVIS_OVERLAYMASK) ++shortcutLocs; else ++folderLocs;
     }
     for (const auto& t : g_targets) {
-        if (t.isLnk) continue;
-        if (lstrcmpiW(matched.c_str(), t.name.c_str()) == 0)
-            ApplyFolderIcon(g_folder, ico);
+        if (!NameMatch(t, loc.text)) continue;
+        if (t.isLnk) ++shortcutTargets; else ++folderTargets;
     }
+    const bool ambiguous = sameLocs > 1;
+    bool useOverlay = false;
+    if (ambiguous) {
+        useOverlay = (shortcutLocs == shortcutTargets && folderLocs == folderTargets &&
+                      shortcutTargets + folderTargets > 0);
+        if (!useOverlay)
+            Log(L"same-name overlay split failed for '%s' (items %d lnk/%d dir, targets %d lnk/%d dir)",
+                loc.text.c_str(), shortcutLocs, folderLocs, shortcutTargets, folderTargets);
+    }
+    const bool locIsShortcut = (loc.overlay & LVIS_OVERLAYMASK) != 0;
+
+    for (const auto& t : g_targets) {
+        if (!NameMatch(t, loc.text)) continue;
+        if (ambiguous && useOverlay && t.isLnk != locIsShortcut) continue;
+        if (t.isLnk) SetLnkIconLocation(t.lnk, ico);
+        else ApplyFolderIcon(g_folder, ico);
+    }
+    if (ambiguous && useOverlay)
+        Log(L"'%s' item %d is the %s", loc.text.c_str(), loc.index,
+            locIsShortcut ? L"shortcut" : L"folder");
 }
 
 void DeleteArtifacts() { DeleteArtifactsIn(g_artifactsDir); }
@@ -1153,7 +1194,7 @@ bool DoCycle() {
             ++skipped;
             continue;
         }
-        ApplyToTargets(loc.text, ico);
+        ApplyToTargets(loc, ico, locs);
         g_iconGen++;
         StoreItemCache(loc.iconRectScreen, s.w, s.h, std::move(s.px));
         g_updates++;
@@ -1335,10 +1376,11 @@ int RunLocate() {
                 GetClassNameA(root, rootCls, 63);
                 DWORD pid = 0;
                 GetWindowThreadProcessId(loc.lv, &pid);
-                printf("  '%ls' item %d rect (%d,%d)-(%d,%d) slot (%d,%d) root=%s pid=%lu\n",
+                printf("  '%ls' item %d rect (%d,%d)-(%d,%d) slot (%d,%d) root=%s pid=%lu overlay=0x%lX%s\n",
                        loc.text.c_str(), loc.index, loc.iconRectScreen.left, loc.iconRectScreen.top,
                        loc.iconRectScreen.right, loc.iconRectScreen.bottom,
-                       loc.slot.x, loc.slot.y, rootCls, pid);
+                       loc.slot.x, loc.slot.y, rootCls, pid, loc.overlay,
+                       (loc.overlay & LVIS_OVERLAYMASK) ? "  <- shortcut" : "");
             }
         } else {
             printf("sample %d: not found on any desktop list view\n", k);
