@@ -509,6 +509,16 @@ void ApplyFolderIcon(const std::wstring& folder, const std::wstring& ico) {
 
 void DeleteArtifacts();
 
+// Minimal icon reset for ONE folder: drop desktop.ini only, keep the shared
+// wall_icon_*.ico artifacts other targets still point at.
+void ResetFolderIconOnly(const std::wstring& folder) {
+    DeleteFileW((folder + L"\\desktop.ini").c_str());
+    DWORD at = GetFileAttributesW(folder.c_str());
+    if (at != INVALID_FILE_ATTRIBUTES)
+        SetFileAttributesW(folder.c_str(), at & ~FILE_ATTRIBUTE_SYSTEM);
+    NotifyShell(folder);
+}
+
 void RestoreFolderIcon(const std::wstring& folder) {
     DeleteFileW((folder + L"\\desktop.ini").c_str());
     DeleteArtifacts();
@@ -1380,6 +1390,13 @@ void StoreItemCache(const RECT& rc, int w, int h, std::vector<BYTE> px) {
     g_itemCache.push_back(std::move(c));
 }
 
+// Was target ti located by the last successful probe pass?
+bool probeFoundIn(int ti) {
+    for (const auto& h : g_probeRects)
+        if (h.targetIdx == ti) return true;
+    return false;
+}
+
 bool DoCycle() {
     if (g_folder.empty() || g_targets.empty()) return false;
     std::vector<std::wstring> names = LocateNames();
@@ -1418,6 +1435,17 @@ bool DoCycle() {
             g_probeValid = true;
             wall::CurrentWallpaper(g_probeWallPath, g_probeWallMtime);
             Log(L"probe calibrated: %d target(s)", (int)g_probeRects.size());
+            // A successful pass is authoritative for EVERY target: anything
+            // whose probe never rendered isn't drawn by this desktop at all
+            // (organizers ignore desktop.ini icons). Reset those to their
+            // default icon instead of leaving them on a probe marker; the
+            // list-view fallback loop skips them below.
+            for (size_t ti = 0; ti < g_targets.size(); ++ti) {
+                if (probeFoundIn((int)ti)) continue;
+                if (g_targets[ti].isLnk) ResetLnkIcon(g_targets[ti].lnk);
+                else ResetFolderIconOnly(g_folder);
+                Log(L"probe: target#%d not rendered -> default icon", (int)ti);
+            }
         } else {
             g_probeRetryAt = g_cycleCount + 50; // ~10s at the default interval
             Log(L"probe pass found nothing; retry in %u cycle(s)",
@@ -1454,6 +1482,14 @@ bool DoCycle() {
     }
 
     for (const auto& loc : locs) {
+        // A successful probe pass is authoritative for EVERY target: found
+        // ones carry (or already equal) their measured icon this cycle,
+        // unrendered ones were reset to their default icon. The list-view
+        // fallback below exists only for when probing failed - running it
+        // anyway would emit .ico files nobody consumes AND overwrite a
+        // probe-corrected icon with wrong list-view-rect content.
+        if (g_probeValid) continue;
+
         const bool covered = RectCovered(loc.iconRectScreen, expPids);
         Shot s;
         bool fromFile = false;
@@ -1611,7 +1647,7 @@ void CreateControls(HWND hwnd) {
                      SS_LEFT | WS_BORDER, 16, 144, 408, 84, 0);
 
     mk(L"BUTTON", L"隐藏窗口 Hide", 0, 16, 244, 120, 30, IDB_HIDE);
-    mk(L"BUTTON", L"恢复默认图标 Restore", 0, 144, 244, 160, 30, IDB_RESTORE);
+    mk(L"BUTTON", L"刷新 Refresh", 0, 144, 244, 160, 30, IDB_RESTORE);
     mk(L"BUTTON", L"退出 Exit", 0, 312, 244, 112, 30, IDB_EXIT);
 }
 
@@ -1631,16 +1667,12 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (id == IDB_HIDE && code == BN_CLICKED) {
             ShowWindow(h, SW_HIDE);
         } else if (id == IDB_RESTORE && code == BN_CLICKED) {
-            for (const auto& t : g_targets)
-                if (t.isLnk) ResetLnkIcon(t.lnk);
-            if (!g_folder.empty() && !HasExt(g_folder, L".lnk") && DirExists(g_folder))
-                RestoreFolderIcon(g_folder);
-            else
-                DeleteArtifacts();
+            // Manual refresh: forget every cache so the next cycle re-probes
+            // the real icon positions and rewrites the icons from scratch.
             g_itemCache.clear();
             g_wallTrusted = false;
             g_probeValid = false;
-            UpdateStatus(L"已恢复默认图标 Icon restored（后台继续伪装中）");
+            UpdateStatus(L"已请求刷新 Refresh requested（下一轮重新校准并重写图标）");
         } else if (id == IDB_EXIT && code == BN_CLICKED) {
             DestroyWindow(h);
         } else if (id == IDC_INTERVAL && code == CBN_SELCHANGE) {
